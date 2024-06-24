@@ -1,10 +1,14 @@
 const { request, gql } = require('graphql-request');
-const sdk = require('@defillama/sdk');
 const axios = require('axios');
+const sdk = require('@defillama/sdk');
+const BigNumber = require('bignumber.js');
 const utils = require('../utils');
 
 const urlMoonbeam = 'https://api.studio.thegraph.com/proxy/78672/pulsar/v0.0.1/';
 const urlBlocksSubgraph = 'https://api.thegraph.com/subgraphs/name/stellaswap/pulsar-blocks';
+const urlConliqSubgraph = 'https://api.thegraph.com/subgraphs/name/stellaswap/pulsar';
+const urlFarmingSubgraph = 'https://api.thegraph.com/subgraphs/name/stellaswap/pulsar-farming';
+const aprApiUrl = 'https://apr-api.stellaswap.com/api/v1/eternalAPR';
 
 const queryPools = gql`
   {
@@ -49,7 +53,7 @@ const queryPrior = gql`
 `;
 
 const tickToSqrtPrice = (tick) => {
-  return Math.sqrt(1.0001 ** tick);
+  return new BigNumber(Math.sqrt(1.0001 ** tick));
 };
 
 const getAmounts = (liquidity, tickLower, tickUpper, currentTick) => {
@@ -57,15 +61,15 @@ const getAmounts = (liquidity, tickLower, tickUpper, currentTick) => {
   const lowerPrice = tickToSqrtPrice(tickLower);
   const upperPrice = tickToSqrtPrice(tickUpper);
   let amount1, amount0;
-  if (currentPrice < lowerPrice) {
-    amount1 = 0;
-    amount0 = liquidity * (1 / lowerPrice - 1 / upperPrice);
-  } else if ((lowerPrice <= currentPrice) && (currentPrice <= upperPrice)) {
-    amount1 = liquidity * (currentPrice - lowerPrice);
-    amount0 = liquidity * (1 / currentPrice - 1 / upperPrice);
+  if (currentPrice.isLessThan(lowerPrice)) {
+    amount1 = new BigNumber(0);
+    amount0 = liquidity.times(new BigNumber(1).div(lowerPrice).minus(new BigNumber(1).div(upperPrice)));
+  } else if (currentPrice.isGreaterThanOrEqualTo(lowerPrice) && currentPrice.isLessThanOrEqualTo(upperPrice)) {
+    amount1 = liquidity.times(currentPrice.minus(lowerPrice));
+    amount0 = liquidity.times(new BigNumber(1).div(currentPrice).minus(new BigNumber(1).div(upperPrice)));
   } else {
-    amount1 = liquidity * (upperPrice - lowerPrice);
-    amount0 = 0;
+    amount1 = liquidity.times(upperPrice.minus(lowerPrice));
+    amount0 = new BigNumber(0);
   }
   return { amount0, amount1 };
 };
@@ -132,7 +136,7 @@ const getPositionsOfPool = async (poolId) => {
         }
       }
     }`;
-    const positions = await fetchWithRetry(urlMoonbeam, queryString);
+    const positions = await fetchWithRetry(urlConliqSubgraph, queryString);
     result.push(...positions.positions);
     if (positions.positions.length < 1000) {
       break;
@@ -142,10 +146,31 @@ const getPositionsOfPool = async (poolId) => {
   return result;
 };
 
+const fetchAprData = async () => {
+  try {
+    const response = await axios.get(aprApiUrl);
+    return response.data.result.farmPools;
+  } catch (error) {
+    console.error(`Failed to fetch APR data: ${error.message}`);
+    return {};
+  }
+};
+
+const calculateAPR = (totalReward, totalNativeAmount) => {
+  const secondsInDay = 86400;
+  const daysInYear = 365;
+  if (totalNativeAmount.isGreaterThan(0)) {
+    return totalReward.dividedBy(totalNativeAmount).times(secondsInDay).times(daysInYear).times(100);
+  }
+  return new BigNumber(0);
+};
+
 const topLvl = async (chainString, timestamp, url) => {
   const aprDelta = 259200;
   const blockDelta = 60;
   const startBlock = 2649799;
+
+  const aprData = await fetchAprData();
 
   const prevBlockNumber = await getPreviousBlockNumber(aprDelta, blockDelta, startBlock);
 
@@ -168,7 +193,7 @@ const topLvl = async (chainString, timestamp, url) => {
       liquidity
     }
   }`;
-  const responsePrior = await fetchWithRetry(url, queryPoolsPrior);
+  const responsePrior = await fetchWithRetry(urlConliqSubgraph, queryPoolsPrior);
   const dataPrior = responsePrior.pools;
 
   let data = (await fetchWithRetry(url, queryPools)).pools;
@@ -196,10 +221,8 @@ const topLvl = async (chainString, timestamp, url) => {
     const x = tokenBalances.output.filter((i) => i.input.params[0] === p.id);
     return {
       ...p,
-      reserve0:
-        x.find((i) => i.input.target === p.token0.id)?.output / `1e${p.token0.decimals}` || 0,
-      reserve1:
-        x.find((i) => i.input.target === p.token1.id)?.output / `1e${p.token1.decimals}` || 0,
+      reserve0: new BigNumber(x.find((i) => i.input.target === p.token0.id)?.output || 0).div(new BigNumber(10).pow(p.token0.decimals)),
+      reserve1: new BigNumber(x.find((i) => i.input.target === p.token1.id)?.output || 0).div(new BigNumber(10).pow(p.token1.decimals)),
     };
   });
 
@@ -207,45 +230,41 @@ const topLvl = async (chainString, timestamp, url) => {
 
   const poolsFees = {};
   const poolsCurrentTvl = {};
+  const ratioMultiplier = new BigNumber(1e18); // ratio is in 0.0000s, this is to get at least 18 decimals figure
 
   for (const pool of data) {
-    const currentFeesInToken0 = parseFloat(pool.feesToken0) + (parseFloat(pool.feesToken1) * parseFloat(pool.token0Price));
+    const currentFeesInToken0 = new BigNumber(pool.feesToken0).plus(new BigNumber(pool.feesToken1).times(new BigNumber(pool.token0Price)));
     const priorData = dataPrior.find(dp => dp.id === pool.id);
-    const priorFeesInToken0 = priorData ? (parseFloat(priorData.feesToken0) + (parseFloat(priorData.feesToken1) * parseFloat(priorData.token0Price))) : 0;
-    const feesIn24Hours = currentFeesInToken0 - priorFeesInToken0;
+    const priorFeesInToken0 = priorData ? new BigNumber(priorData.feesToken0).plus(new BigNumber(priorData.feesToken1).times(new BigNumber(priorData.token0Price))) : new BigNumber(0);
+    const feesIn24Hours = currentFeesInToken0.minus(priorFeesInToken0);
 
     poolsFees[pool.id] = feesIn24Hours;
-    poolsCurrentTvl[pool.id] = 0;
+    poolsCurrentTvl[pool.id] = new BigNumber(0);
 
     const positionsJson = await getPositionsOfPool(pool.id);
     for (const position of positionsJson) {
-      const currentTick = parseFloat(pool.tick);
+      const currentTick = new BigNumber(pool.tick);
       const { amount0, amount1 } = getAmounts(
-        parseFloat(position.liquidity),
-        parseFloat(position.tickLower.tickIdx),
-        parseFloat(position.tickUpper.tickIdx),
+        new BigNumber(position.liquidity),
+        new BigNumber(position.tickLower.tickIdx),
+        new BigNumber(position.tickUpper.tickIdx),
         currentTick,
       );
-      const adjustedAmount0 = amount0 / (10 ** parseFloat(position.token0.decimals));
-      const adjustedAmount1 = amount1 / (10 ** parseFloat(position.token1.decimals));
-      poolsCurrentTvl[pool.id] += adjustedAmount0;
-      poolsCurrentTvl[pool.id] += adjustedAmount1 * parseFloat(pool.token0Price);
-    }
-  }
-
-  const poolsAPR = {};
-  for (const pool of data) {
-    if (poolsCurrentTvl[pool.id] !== 0) {
-      poolsAPR[pool.id] = ((poolsFees[pool.id] * 365) / poolsCurrentTvl[pool.id]) * 100;
-    } else {
-      poolsAPR[pool.id] = 0;
+      const adjustedAmount0 = amount0.div(new BigNumber(10).pow(position.token0.decimals));
+      const adjustedAmount1 = amount1.div(new BigNumber(10).pow(position.token1.decimals));
+      poolsCurrentTvl[pool.id] = poolsCurrentTvl[pool.id].plus(adjustedAmount0).plus(adjustedAmount1.times(new BigNumber(pool.token0Price)));
     }
   }
 
   data = data.map((p) => {
-    // Calculate APR and APY
-    const apr = poolsAPR[p.id];
-    const apy = (Math.pow(1 + apr / 365, 365) - 1) * 100;
+    const aprDataForPool = aprData[p.id];
+    const apr = aprDataForPool ? new BigNumber(aprDataForPool.lastApr) : new BigNumber(0);
+    const apy = (Math.pow(1 + apr.dividedBy(365).toNumber(), 365) - 1) * 100;
+    console.log("POOL", p.id)
+    console.log("apr", apr.isNaN() ? 0 : apr.toNumber())
+    console.log("apy", isNaN(apy) ? 0 : apy)
+
+
 
     return {
       pool: p.id,
@@ -254,15 +273,16 @@ const topLvl = async (chainString, timestamp, url) => {
       symbol: `${p.token0.symbol}-${p.token1.symbol}`,
       tvlUsd: parseFloat(p.totalValueLockedUSD),
       apyBase: isNaN(apy) ? 0 : apy,
-      apr: isNaN(apr) ? 0 : apr,
+      // apr: apr.isNaN() ? 0 : apr.toNumber(),
       underlyingTokens: [p.token0.id, p.token1.id],
-      url: `https://stellaswap.com/pools/${p.id}`,
+      url: `https://app.stellaswap.com/pulsar/add/${p.token0.id}/${p.token1.id}`,
     };
   });
 
   // Filter out pools with invalid or missing fields
   data = data.filter(p => p.pool && p.chain && p.project && p.symbol && p.underlyingTokens.length && p.url);
-
+  
+  // console.log("DATA: ", data);
   return data;
 };
 
