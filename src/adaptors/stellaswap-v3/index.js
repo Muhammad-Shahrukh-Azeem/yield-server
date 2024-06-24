@@ -1,5 +1,4 @@
 const { request, gql } = require('graphql-request');
-const axios = require('axios');
 const sdk = require('@defillama/sdk');
 const BigNumber = require('bignumber.js');
 const utils = require('../utils');
@@ -8,7 +7,6 @@ const urlMoonbeam = 'https://api.studio.thegraph.com/proxy/78672/pulsar/v0.0.1/'
 const urlBlocksSubgraph = 'https://api.thegraph.com/subgraphs/name/stellaswap/pulsar-blocks';
 const urlConliqSubgraph = 'https://api.thegraph.com/subgraphs/name/stellaswap/pulsar';
 const urlFarmingSubgraph = 'https://api.thegraph.com/subgraphs/name/stellaswap/pulsar-farming';
-const aprApiUrl = 'https://apr-api.stellaswap.com/api/v1/eternalAPR';
 
 const queryPools = gql`
   {
@@ -146,31 +144,162 @@ const getPositionsOfPool = async (poolId) => {
   return result;
 };
 
-const fetchAprData = async () => {
-  try {
-    const response = await axios.get(aprApiUrl);
-    return response.data.result.farmPools;
-  } catch (error) {
-    console.error(`Failed to fetch APR data: ${error.message}`);
-    return {};
+const getEternalFarmingInfo = async () => {
+  const queryString = `
+  {
+    eternalFarmings{
+      id
+      rewardToken
+      bonusRewardToken
+      rewardRate
+      bonusRewardRate
+      pool
+    }
   }
+  `;
+  const eternalFarmings = await request(urlFarmingSubgraph, queryString);
+  return eternalFarmings.eternalFarmings;
 };
 
-const calculateAPR = (totalReward, totalNativeAmount) => {
-  const secondsInDay = 86400;
-  const daysInYear = 365;
-  if (totalNativeAmount.isGreaterThan(0)) {
-    return totalReward.dividedBy(totalNativeAmount).times(secondsInDay).times(daysInYear).times(100);
+const getTokenInfoByAddress = async (tokenAddress) => {
+  const queryString = `
+  {
+    tokens(where:{id:"${tokenAddress}"}){
+      derivedMatic
+      decimals
+    }
   }
-  return new BigNumber(0);
+  `;
+  const tokens = await request(urlConliqSubgraph, queryString);
+  return tokens.tokens;
+};
+
+const getPositionsInEternalFarming = async (farmingId) => {
+  const result = [];
+  let i = 0;
+  while (true) {
+    const queryString = `{
+      deposits(where:{eternalFarming:"${farmingId}"}, first:1000, skip:${i * 1000}){
+        id
+      }
+    }`;
+    const positions = await request(urlFarmingSubgraph, queryString);
+    result.push(...positions.deposits);
+    if (positions.deposits.length < 1000) {
+      break;
+    }
+    i += 1;
+  }
+  return result;
+};
+
+const getPositionsById = async (tokenIds) => {
+  tokenIds = tokenIds.map((tokenId) => tokenId.id);
+  const result = [];
+  let i = 0;
+  while (true) {
+    const queryString = `{
+      positions(where:{id_in:${JSON.stringify(tokenIds)}}, first:1000, skip:${i * 1000}){
+        id
+        liquidity
+        tickLower{
+          tickIdx
+        }
+        tickUpper{
+          tickIdx
+        }
+        pool{
+          token0{
+            name
+            decimals
+            derivedMatic
+          }
+          token1{
+            name
+            decimals
+            derivedMatic
+          }
+          tick
+        }
+      }
+    }`;
+    const positions = await request(urlConliqSubgraph, queryString);
+    result.push(...positions.positions);
+    if (positions.positions.length < 1000) {
+      break;
+    }
+    i += 1;
+  }
+  return result;
+};
+
+const updateEternalFarmsApr = async () => {
+  console.log('Updating Farms APR');
+  const eternalFarmings = await getEternalFarmingInfo();
+  const eternalObj = {
+    farmPools: {},
+    farms: {},
+    updatedAt: 0,
+  };
+  for (const farming of eternalFarmings) {
+    const tokenIds = await getPositionsInEternalFarming(farming.id);
+    const token0 = (await getTokenInfoByAddress(farming.rewardToken))[0];
+    const token1 = (await getTokenInfoByAddress(farming.bonusRewardToken))[0];
+    let totalNativeAmount = 0.0;
+    const positions = await getPositionsById(tokenIds);
+
+    for (const position of positions) {
+      const { amount0, amount1 } = getAmounts(
+        new BigNumber(position.liquidity),
+        new BigNumber(position.tickLower.tickIdx),
+        new BigNumber(position.tickUpper.tickIdx),
+        new BigNumber(position.pool.tick),
+      );
+      totalNativeAmount += (amount0 * new BigNumber(position.pool.token0.derivedMatic)) / new BigNumber(10).pow(position.pool.token0.decimals);
+      totalNativeAmount += (amount1 * new BigNumber(position.pool.token1.derivedMatic)) / new BigNumber(10).pow(position.pool.token1.decimals);
+    }
+
+    const token0RewardRate = new BigNumber(farming.rewardRate);
+    const token0Matic = new BigNumber(token0.derivedMatic);
+    const token0Decimals = new BigNumber(10).pow(token0.decimals);
+    const reward0PerSecond = token0RewardRate.times(token0Matic).dividedBy(token0Decimals);
+    let totalReward = reward0PerSecond;
+    let reward1PerSecond = 0;
+    if (token1?.derivedMatic) {
+      const token1RewardRate = new BigNumber(farming.bonusRewardRate);
+      const token1Matic = new BigNumber(token1.derivedMatic);
+      const token1Decimals = new BigNumber(10).pow(token1.decimals);
+      reward1PerSecond = token1RewardRate.times(token1Matic).dividedBy(token1Decimals);
+      totalReward = totalReward.plus(reward1PerSecond);
+    }
+
+    let apr = new BigNumber(0);
+    let rewardTokenApr = new BigNumber(0);
+    let bonusTokenApr = new BigNumber(0);
+    if (totalNativeAmount > 0) {
+      apr = totalReward.dividedBy(new BigNumber(totalNativeAmount)).times(86400 * 365 * 100);
+      rewardTokenApr = reward0PerSecond.dividedBy(new BigNumber(totalNativeAmount)).times(86400 * 365 * 100);
+      bonusTokenApr = reward1PerSecond !== 0 ? reward1PerSecond.dividedBy(new BigNumber(totalNativeAmount)).times(86400 * 365 * 100) : new BigNumber(0);
+    }
+    eternalObj.farms[farming.id] = apr.toString();
+    eternalObj.farmPools[farming.pool] = {
+      farmindId: farming.id,
+      lastApr: apr.toString(),
+      rewardTokenApr: rewardTokenApr.toString(),
+      rewardToken: farming.rewardToken,
+      bonusTokenApr: bonusTokenApr.toString(),
+      bonusToken: farming.bonusRewardToken,
+    };
+  }
+
+  eternalObj.updatedAt = (Date.now() / 1000).toFixed(0);
+  return eternalObj;
 };
 
 const topLvl = async (chainString, timestamp, url) => {
   const aprDelta = 259200;
   const blockDelta = 60;
   const startBlock = 2649799;
-
-  const aprData = await fetchAprData();
 
   const prevBlockNumber = await getPreviousBlockNumber(aprDelta, blockDelta, startBlock);
 
@@ -256,15 +385,19 @@ const topLvl = async (chainString, timestamp, url) => {
     }
   }
 
-  data = data.map((p) => {
-    const aprDataForPool = aprData[p.id];
+  const eternalAPRObj = await updateEternalFarmsApr();
+  const poolsAPR = {};
+  for (const pool of data) {
+    const aprDataForPool = eternalAPRObj.farmPools[pool.id];
     const apr = aprDataForPool ? new BigNumber(aprDataForPool.lastApr) : new BigNumber(0);
+    poolsAPR[pool.id] = apr;
+  }
+
+  data = data.map((p) => {
+    const apr = poolsAPR[p.id];
     const apy = (Math.pow(1 + apr.dividedBy(365).toNumber(), 365) - 1) * 100;
-    console.log("POOL", p.id)
-    console.log("apr", apr.isNaN() ? 0 : apr.toNumber())
-    console.log("apy", isNaN(apy) ? 0 : apy)
-
-
+    // console.log("POOL", p.id)
+    // console.log("apr", apr.isNaN() ? 0 : apr.toNumber())
 
     return {
       pool: p.id,
@@ -272,8 +405,7 @@ const topLvl = async (chainString, timestamp, url) => {
       project: 'stellaswap-v3',
       symbol: `${p.token0.symbol}-${p.token1.symbol}`,
       tvlUsd: parseFloat(p.totalValueLockedUSD),
-      apyBase: isNaN(apy) ? 0 : apy,
-      // apr: apr.isNaN() ? 0 : apr.toNumber(),
+      apyBase: apr.isNaN() ? 0 : apr.toNumber(),
       underlyingTokens: [p.token0.id, p.token1.id],
       url: `https://app.stellaswap.com/pulsar/add/${p.token0.id}/${p.token1.id}`,
     };
@@ -282,7 +414,6 @@ const topLvl = async (chainString, timestamp, url) => {
   // Filter out pools with invalid or missing fields
   data = data.filter(p => p.pool && p.chain && p.project && p.symbol && p.underlyingTokens.length && p.url);
   
-  // console.log("DATA: ", data);
   return data;
 };
 
